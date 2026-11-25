@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/xtls/libxray/nodep"
+	"github.com/xtls/xray-core/app/proxyman"
 	xrayNet "github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/session"
 	"github.com/xtls/xray-core/core"
@@ -55,11 +56,6 @@ func PingBatch(
 	if err := validatePingBatchRequest(items, timeout, targetURL); err != nil {
 		return nil, err
 	}
-	coreServerMu.Lock()
-	defer coreServerMu.Unlock()
-	if coreServer != nil {
-		return nil, errors.New("pingBatch requires an isolated process without a managed Xray instance")
-	}
 
 	results := make([]PingBatchResult, len(items))
 	prepared := make([]preparedPingItem, 0, len(items))
@@ -88,6 +84,16 @@ func PingBatch(
 		mergedOutbounds = append(mergedOutbounds, namespaced...)
 	}
 
+	if sharesDialerState(mergedOutbounds) {
+		coreServerMu.Lock()
+		defer coreServerMu.Unlock()
+	} else {
+		coreServerMu.RLock()
+		defer coreServerMu.RUnlock()
+	}
+	if coreServer != nil {
+		return nil, errors.New("pingBatch requires an isolated process without a managed Xray instance")
+	}
 	if len(prepared) == 0 {
 		return results, nil
 	}
@@ -333,9 +339,43 @@ func pingOutboundDependencyTags(outbound conf.OutboundDetourConfig) []string {
 	return dependencies
 }
 
+// sharesDialerState reports whether any outbound dials through what xray-core
+// keeps process-wide and points at the newest instance: the handler a
+// dialerProxy names, or the DNS client a domain or target strategy resolves
+// with. Such a batch runs alone, so no other instance is built meanwhile.
+func sharesDialerState(outbounds []conf.OutboundDetourConfig) bool {
+	for _, outbound := range outbounds {
+		built, err := outbound.Build()
+		if err != nil {
+			return true
+		}
+		instance, err := built.SenderSettings.GetInstance()
+		if err != nil {
+			return true
+		}
+		sender, ok := instance.(*proxyman.SenderConfig)
+		if !ok {
+			return true
+		}
+		sockopt := sender.GetStreamSettings().GetSocketSettings()
+		if sockopt.GetDialerProxy() != "" ||
+			sockopt.GetDomainStrategy().HasStrategy() ||
+			sender.GetTargetStrategy().HasStrategy() {
+			return true
+		}
+	}
+	return false
+}
+
+// pingServerMu serializes building ping instances: core.New points
+// xray-core's process-wide dialer state at the instance it builds.
+var pingServerMu sync.Mutex
+
 func startPingBatchServer(
 	outbounds []conf.OutboundDetourConfig,
 ) (*core.Instance, error) {
+	pingServerMu.Lock()
+	defer pingServerMu.Unlock()
 	config, err := (&conf.Config{OutboundConfigs: outbounds}).Build()
 	if err != nil {
 		return nil, fmt.Errorf("failed to build ping batch config: %w", err)

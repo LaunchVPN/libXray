@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -412,4 +413,134 @@ func ExamplePingBatch() {
 		true,
 	)
 	fmt.Println(len(results))
+}
+
+// heldServer holds each request until release, which a failed test also calls
+// so that closing the server does not wait on held handlers.
+func heldServer(t *testing.T) (url string, started chan struct{}, release func()) {
+	started = make(chan struct{}, 16)
+	held := make(chan struct{})
+	release = sync.OnceFunc(func() { close(held) })
+	server := httptest.NewServer(http.HandlerFunc(func(
+		response http.ResponseWriter,
+		request *http.Request,
+	) {
+		started <- struct{}{}
+		<-held
+		response.WriteHeader(http.StatusNoContent)
+	}))
+	t.Cleanup(server.Close)
+	t.Cleanup(release)
+	return server.URL, started, release
+}
+
+func probeOnce(url string) ([]PingBatchResult, error) {
+	return PingBatch(
+		[]PingBatchItem{{XrayJSON: `{"outbounds":[{"protocol":"freedom"}]}`}},
+		5,
+		url,
+		false,
+	)
+}
+
+func TestPingBatchCallsOverlap(t *testing.T) {
+	url, started, release := heldServer(t)
+
+	const calls = 15
+	errs := make(chan error, calls)
+	for range calls {
+		go func() {
+			results, err := probeOnce(url)
+			if err == nil && !results[0].Success {
+				err = fmt.Errorf("probe failed: %s", results[0].Error)
+			}
+			errs <- err
+		}()
+	}
+	for range calls {
+		select {
+		case <-started:
+		case <-time.After(3 * time.Second):
+			t.Fatal("pingBatch calls did not overlap")
+		}
+	}
+	release()
+	for range calls {
+		if err := <-errs; err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func TestManagedCoreWaitsForPingBatch(t *testing.T) {
+	for name, operation := range map[string]func() error{
+		"runXray": func() error {
+			defer func() { _ = StopXray() }()
+			return RunXray(minimalConfig)
+		},
+		"testXray": func() error { return TestXray(minimalConfig) },
+	} {
+		t.Run(name, func(t *testing.T) {
+			url, started, release := heldServer(t)
+
+			probed := make(chan []PingBatchResult, 1)
+			go func() {
+				results, _ := probeOnce(url)
+				probed <- results
+			}()
+			<-started
+
+			finished := make(chan error, 1)
+			go func() { finished <- operation() }()
+			select {
+			case err := <-finished:
+				t.Fatalf("%s ran beside a probe: %v", name, err)
+			case <-time.After(300 * time.Millisecond):
+			}
+			release()
+			if results := <-probed; len(results) != 1 || !results[0].Success {
+				t.Fatalf("probe = %+v, want a success", results)
+			}
+			if err := <-finished; err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func TestPingBatchThroughSharedDialerStateRunsAlone(t *testing.T) {
+	url, started, release := heldServer(t)
+
+	held := make(chan error, 1)
+	go func() {
+		_, err := probeOnce(url)
+		held <- err
+	}()
+	<-started
+
+	chained := make(chan []PingBatchResult, 1)
+	go func() {
+		results, _ := PingBatch(
+			[]PingBatchItem{{XrayJSON: `{"outbounds":[
+				{"protocol":"freedom","tag":"proxy","streamSettings":{"sockopt":{"dialerProxy":"hop"}}},
+				{"protocol":"freedom","tag":"hop"}
+			]}`}},
+			5,
+			url,
+			false,
+		)
+		chained <- results
+	}()
+	select {
+	case <-started:
+		t.Fatal("a dialerProxy chain was measured beside another probe")
+	case <-time.After(300 * time.Millisecond):
+	}
+	release()
+	if err := <-held; err != nil {
+		t.Fatal(err)
+	}
+	if results := <-chained; len(results) != 1 || !results[0].Success {
+		t.Fatalf("chained probe = %+v, want a success", results)
+	}
 }

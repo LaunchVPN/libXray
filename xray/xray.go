@@ -11,8 +11,11 @@ import (
 	_ "github.com/xtls/xray-core/main/distro/all"
 )
 
+// coreServerMu keeps the managed instance apart from temporary ones.
+// PingBatch calls that dial only through their own instance share it and
+// overlap one another; anything else holds it alone.
 var (
-	coreServerMu sync.Mutex
+	coreServerMu sync.RWMutex
 	coreServer   *core.Instance
 )
 
